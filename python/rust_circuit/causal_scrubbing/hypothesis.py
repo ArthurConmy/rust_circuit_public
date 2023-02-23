@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import functools
-import uuid
 from collections import Counter
-from typing import Callable, Dict, Hashable, List, Optional, Protocol, Set, Tuple, Union
+from typing import Callable, Dict, List, Mapping, MutableMapping, Optional, Protocol, Set, Tuple, Union
 from warnings import warn
 
 import attrs
 import torch
-
 from rust_circuit import (
     Circuit,
+    restrict,
     GeneralFunction,
     GeneralFunctionShapeInfo,
     GeneralFunctionSpecBase,
@@ -19,103 +18,14 @@ from rust_circuit import (
     MatcherIn,
     PrintHtmlOptions,
     PrintOptions,
-    hash_tensor,
-    new_traversal,
-    restrict,
 )
 
-from .dataset import Dataset, color_dataset
+from rust_circuit.causal_scrubbing.dataset import Dataset, color_dataset
 
 
-@attrs.define(eq=True, hash=True, init=False)
-class PoolAnnotation:
-    """
-    Pool annotation for a cond sampler. See pool.py demo for more info.
-
-    size: size of the pool, i.e. how many different datasets will be sampled. A pool size of 1 has semantic meaning
-        (you want to enforce things being sampled together). A pool of size, say, 4-10 is useful for performance.
-        Intermediate sizes seem confusing, it's not clear to me why you would want them.
-    id: to define which annotations, and therefore which cond samplers, are sharing a pool.
-    """
-
-    size: int
-    id: uuid.UUID
-
-    def __init__(self, size: int = 4, id: Optional[uuid.UUID] = None):
-        if size <= 0:
-            raise ValueError(size)
-        self.size = size
-        self.id = uuid.uuid4() if id is None else id
-
-
-@attrs.define(hash=True, eq=True)
-class PoolNotPresent:
-    ...
-
-
-PNP = PoolNotPresent()
-MaybePoolAnnotation = Union[PoolAnnotation, PoolNotPresent]
-
-DsEqClassT = Hashable
-Pool = List[Optional[Dataset]]
-PoolPerDsEqClass = dict[DsEqClassT, Pool]
-SharedPoolKey = Tuple["CondSampler", Dataset]
-PoolsPerSampler = dict[SharedPoolKey, PoolPerDsEqClass]
-
-
-@attrs.define(hash=True, eq=True)
 class CondSampler(Protocol):
-    """
-    Responsible for sampling a new dataset given a source dataset to draw from, and a reference dataset.
-
-    Parameters:
-    'pool_annot`: See pool.py demo for more info. If PoolNotPresent (the default), no sample reuse will
-        happen. Using pools is recommended if your treeified model is too big (e.g for deep networks with
-        non-trivial samplers).
-    """
-
-    pool_annot: MaybePoolAnnotation = PNP
-
     def __call__(self, ref: Dataset, ds: Dataset, rng=None) -> Dataset:
         ...
-
-    def ds_eq_class(self, ds: Dataset) -> Hashable:
-        """
-        Defines what reference datasets share a pool. By default, no sharing is allowed.
-
-        This should return some value which will be the same for datasets that "are the same, according to this sampler."
-
-        Note: not guaranteed to actually agree with __call__, that's up to the author.
-        """
-        return ds
-
-    def sample_and_update_pool(
-        self, ref: Dataset, ds: Dataset, rng: torch.Generator, pools_per_sampler: PoolsPerSampler
-    ) -> Dataset:
-        """
-        Reuses a dataset from the pool or samples a new one and updates the pool.
-        """
-        if isinstance(self.pool_annot, PoolNotPresent):
-            return self(ref, ds, rng)
-
-        # Get pools for this sampler. Based on hash, which depends on its PoolAnnotation as well as other attrs.
-        if (self, ds) not in pools_per_sampler:
-            pools_per_sampler[(self, ds)] = PoolPerDsEqClass()
-        pools = pools_per_sampler[(self, ds)]
-
-        # Get the pool for the ref ds. Depends on what ref ds's eq class is, according to this sampler.
-        ref_eq_class = self.ds_eq_class(ref)
-        if ref_eq_class not in pools:
-            pools[ref_eq_class] = [None for _ in range(self.pool_annot.size)]
-        pool = pools[ref_eq_class]
-
-        # Pick a ds from the pool, lazily sampling a new one if needed.
-        picked = torch.randint(low=0, high=len(pool), size=(), generator=rng)
-        picked_ds = pool[picked]
-        if picked_ds is None:
-            picked_ds = self(ref, ds, rng)
-            pool[picked] = picked_ds
-        return picked_ds
 
     def pretty_str(self, data: Optional[Dataset], datum_idx=0) -> str:
         # Not __str__ because it takes a dataset
@@ -130,34 +40,23 @@ class CondSampler(Protocol):
             extra = f"({extra})"
         return f"{self.class_str()}{extra}"
 
-    def class_str(self):
-        return f"{self.__class__.__name__}" + (f"#{hash(self.pool_annot) & 1023}" if self.pool_annot != PNP else "")
+    @classmethod
+    def class_str(cls):
+        return cls.__name__
 
     def str_cond(self, datum: Dataset) -> str:
         return ""
 
 
-@attrs.define(hash=True, eq=True, init=False)
+@attrs.define
 class FuncSampler(CondSampler):
     """
     Samples each datum uniformly from the subset of ds that agrees on the value of func. That is, for x in ref_ds we sample a corresponding x' uniformly from `[y for y in ds if func(y) == func(x)]`.
-
     This impliments the standard causal scrubbing sampling operation as described in the writeup, if func returns the feature(s) computed by the interp node.
-
     `func: Dataset -> Tensor` must return a 1 or 2 dimensional tensor, where the first dimesion is the same length as the dataset the function is called on.
     """
 
-    func: Callable[[Dataset], torch.Tensor] = attrs.field(
-        kw_only=True
-    )  # irrelevant since we are writing our own init method, but attrs complains otherwise
-
-    def __init__(
-        self,
-        func: Callable[[Dataset], torch.Tensor],
-        pool_annot: MaybePoolAnnotation = PNP,
-    ):
-        self.func = func
-        self.pool_annot = pool_annot
+    func: Callable[[Dataset], torch.Tensor]
 
     @staticmethod
     @functools.lru_cache(maxsize=128)
@@ -199,9 +98,6 @@ class FuncSampler(CondSampler):
         assert (idxs != -1).all(), "this should never happen!"
         return ds[idxs]
 
-    def ds_eq_class(self, ds):
-        return hash_tensor(self.func(ds))
-
     def str_cond(self, datum: Dataset) -> str:
         out = self.func(datum)[0]
         if isinstance(out, torch.Tensor) and out.numel() == 1:
@@ -209,83 +105,62 @@ class FuncSampler(CondSampler):
         return f"f(d)={str(out)}"
 
 
-@attrs.define(hash=True, eq=True)
 class UncondSampler(CondSampler):
     """
-    Samples randomly without conditioning on the reference dataset.
+    Samples randomly without conditioning on the reference dataset,
+    and deterministically as a function of id.
     """
 
     def __call__(self, ref: Dataset, ds: Dataset, rng=None) -> Dataset:
         return ds.sample(len(ref), rng)
 
-    def ds_eq_class(self, ds):
-        return ()
 
-
-@attrs.define(hash=True, eq=True)
-class UncondTogetherSampler(UncondSampler):
+class FixedUncondSampler(CondSampler):
     """
     Samples randomly without conditioning on the reference dataset,
-    and has a pool of size 1 so a single sample will be reused.
-
-    By default all instances of this class are equal, so all nodes with an
-    UncondTogetherSampler will get the same ds, but you can pass a different
-    uuid at init if you want to create groups of nodes.
+    and deterministically as a function of id.
     """
 
-    def __init__(self, id=uuid.UUID("566ae005-4a34-4e37-9383-731e1a722ef2")):
-        self.pool_annot = PoolAnnotation(1, id=id)
+    seed: int
+
+    def __init__(self, seed=978669):
+        self.seed = seed
+        self.generator = torch.Generator()
+
+    def __call__(self, ref: Dataset, ds: Dataset, rng=None) -> Dataset:
+        # Always uses the same rng state, so samples the same if ds is the same
+        self.generator.manual_seed(self.seed)
+        return ds.sample(len(ref), self.generator)
+
+    def str_cond(self, datum: Dataset) -> str:
+        return f"seed={self.seed}"
 
 
-@attrs.define(hash=True, eq=True)
+class FixedToDatasetSampler(CondSampler):
+    """
+    Used by ACDC to sample fixed unrelated data in the same order as the reference dataset.
+    """
+
+    def __call__(self, ref: Dataset, ds: Dataset, rng=None) -> Dataset:
+        assert len(ref) == len(ds), f"Paired sampler requires datasets of same length, got {len(ref)} and {len(ds)}"
+        return ds
+
+
 class ExactSampler(CondSampler):
     def __call__(self, ref: Dataset, ds: Dataset, rng=None) -> Dataset:
         return ref  # should maybe check this is valid draw from ds
-
-
-@attrs.define(hash=True, eq=True)
-class FixedOtherSampler(UncondSampler):
-    other: Dataset = attrs.field(
-        kw_only=True
-    )  # irrelevant since we are writing our own init method, but attrs complains otherwise
-
-    def __init__(self, other: Dataset):
-        super().__init__()
-        self.other = other
-
-    def __call__(self, ref: Dataset, ds: Dataset, rng=None) -> Dataset:
-        assert len(self.other) == len(ref), (len(self.other), len(ref))
-        return self.other  # should maybe check this is a valid draw from ds
 
 
 def chain_excluding(parent: IterativeMatcher, child: IterativeMatcherIn, term_early_at: MatcherIn = False):
     """Matches `child` from `parent`, excluding any intermediate nodes matched by `term_early_at`."""
     if term_early_at is False:
         return parent.chain(child)
-    return restrict(parent.chain(IterativeMatcher(child)), term_early_at=term_early_at)
+    return parent.chain(restrict(IterativeMatcher(child), term_early_at=term_early_at))
 
 
-@attrs.define(frozen=True)
-class SampledInputs:
-    """Holds the sampled inputs at each node of an interpretation graph."""
+InterpOutType = torch.Tensor
 
-    datasets: dict[InterpNode, Dataset] = attrs.field(factory=dict)
-    other_inputs_datasets: dict[InterpNode, Dataset] = attrs.field(factory=dict)
-    sampler_pools: PoolsPerSampler = attrs.field(factory=dict)
-
-    def __getitem__(self, node: InterpNode) -> Dataset:
-        if node.is_leaf():
-            return self.datasets[node]
-        else:
-            return self.other_inputs_datasets[node]
-
-    def get(self, node: InterpNode, default: Optional[Dataset] = None) -> Optional[Dataset]:
-        try:
-            return self[node]
-        except KeyError:
-            return default
-
-
+# TODO: name as CondSamplerGeneralFunctionSpec ??
 class InterpNodeGeneralFunctionSpec(GeneralFunctionSpecBase):
     def __init__(self, function, name):
         self.function = function
@@ -302,12 +177,30 @@ class InterpNodeGeneralFunctionSpec(GeneralFunctionSpecBase):
         return GeneralFunctionShapeInfo((), 0, [])
 
 
+@attrs.define(frozen=True)
+class SampledInputs:
+    """Holds the sampled inputs at each node of an interpretation graph."""
+
+    datasets: dict[InterpNode, Dataset] = attrs.field(factory=dict)
+    other_inputs_datasets: dict[InterpNode, Dataset] = attrs.field(factory=dict)
+
+    def __getitem__(self, node: InterpNode) -> Dataset:
+        if node.is_leaf():
+            return self.datasets[node]
+        else:
+            return self.other_inputs_datasets[node]
+
+    def get(self, node: InterpNode, default: Optional[Dataset] = None) -> Optional[Dataset]:
+        try:
+            return self[node]
+        except KeyError:
+            return default
+
+
 class InterpNode:
     """
     Interpretation graph (tree!) node.
-
     It doesn't have to be a tree in general, but we are lazy and haven't written treeification code for it.
-
     cond_sampler: samples data that this node is "indifferent between", e.g.
         data agreeing on a feature with a reference datum if this node only cares about that feature
     name: should be unique within an interpretation. it's nice to be able to uniquely identify things
@@ -398,7 +291,9 @@ class InterpNode:
         c, map = to_circuit(self)
 
         if options is None:
-            new_options: Union[PrintOptions, PrintHtmlOptions] = PrintHtmlOptions(traversal=new_traversal())
+            new_options: Union[PrintOptions, PrintHtmlOptions] = PrintHtmlOptions(
+                traversal=IterativeMatcher.noop_traversal()
+            )
         else:
             new_options = options.evolve()
         if print_data:
@@ -428,11 +323,9 @@ class InterpNode:
         recursive: bool = True,
     ):
         # The one place that mutating SampledInputs is allowed
-        ds = self.cond_sampler.sample_and_update_pool(parent_ds, source_ds, rng, into.sampler_pools)
+        ds = self.cond_sampler(parent_ds, source_ds, rng)
         if not self.is_leaf():
-            into.other_inputs_datasets[self] = self.other_inputs_sampler.sample_and_update_pool(
-                ds, source_ds, rng, into.sampler_pools
-            )
+            into.other_inputs_datasets[self] = self.other_inputs_sampler(ds, source_ds, rng)
         into.datasets[self] = ds
         if recursive:
             for child in self.children:
@@ -470,7 +363,7 @@ class InterpNode:
         return str(self)
 
 
-corr_root_matcher = restrict(new_traversal(), term_if_matches=True)
+corr_root_matcher = restrict(IterativeMatcher.noop_traversal(), term_if_matches=True)
 
 
 class IllegalCorrespondenceError(Exception):
@@ -491,16 +384,14 @@ def to_inputs(matcher: IterativeMatcher, ds: DatasetOrInputNames) -> IterativeMa
 class Correspondence:
     """
     Holds correspondences between interp graph and model.
-
     The parts of the model are pointed at by IterativeMatchers picking out subgraphs of the model (with a single source and sink).
     In theory land we imagine that our correspondences are surjective, but in practice this is painful to implement: you either
     need drastic circuit rewrites, or very many InterpNodes and entries in your correspondence. To make life easier, we allow
     correspondences to model "branches" picked out by matchers.
-
     corr: mapping from interpretation to branches in the model
     """
 
-    corr: Dict[InterpNode, IterativeMatcher]
+    corr: MutableMapping[InterpNode, IterativeMatcher]
     i_names: Dict[str, InterpNode]
 
     def __init__(self):

@@ -3,12 +3,11 @@ from __future__ import annotations
 from typing import Dict, Iterable, Mapping, Optional, Set, Type, TypeVar, Union
 
 import attrs
+import rust_circuit as rc
 import torch
 from attr import frozen
 
-import rust_circuit as rc
-
-from ..py_utils import FrozenDict
+from rust_circuit.py_utils import FrozenDict
 
 
 def all_same_len(self: Dataset, attribute, arrs: Mapping[str, rc.Array]):
@@ -50,7 +49,7 @@ def frozenset_converter(xs: Set[str]) -> frozenset[str]:  # mypy has issues with
 TDataset = TypeVar("TDataset", bound="Dataset")
 
 
-@frozen(hash=True)
+@frozen
 class Dataset:
     # Holds arrays look-up-able by name; you can provide any iterable and it will be turned into a map.
     # In particular no two can have the same name. Also, they can be accessed as `ds.arr_name`, unless

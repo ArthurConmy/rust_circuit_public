@@ -1,9 +1,11 @@
 from typing import Callable, Tuple
 
+import numpy as np
 import torch
+from attr import frozen
+from rust_circuit import Array, DiscreteVar
 
-from rust_circuit import Array
-from rust_circuit.causal_scrubbing.dataset import Dataset
+from interp.circuit.causal_scrubbing.dataset import Dataset
 
 
 def loss_fn(ds: Dataset, out_dict) -> float:
